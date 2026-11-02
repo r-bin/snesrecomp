@@ -422,6 +422,14 @@ void   cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v);
  * interpreter's bridge shims use the plain accessors (they account
  * transfers themselves). */
 uint32_t  cpu_region_speed(uint32_t adr);
+/* Bus-exact generated code: clocks from the running compiled instruction's
+ * start to its data access (and to an RMW's write); AOT_NO_ACCESS outside. */
+#define AOT_NO_ACCESS 0xFFFFFFFFu
+extern uint32_t g_aot_access_prefix, g_aot_access_wprefix;
+void cpu_aot_insn_begin(const CpuState *cpu, uint32_t pc16);
+/* The lead of an I/O access made by the running bus-exact instruction: 1 and
+ * *lead when adr is the low or high byte of its noted access. */
+int cpu_aot_access_lead(uint16 adr, uint32_t *lead);
 /* SNESRECOMP_WLOG_ADDR hook for direct-WRAM stores that bypass cpu_write8/16
  * (DMA A-bus writes in snes_write, WMDATA $2180). wa = g_ram offset. */
 void wlog_addr_note_direct(uint32_t wa, uint8_t v, const char *via);

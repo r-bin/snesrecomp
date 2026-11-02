@@ -219,6 +219,12 @@ static void bridge_note_access(uint32_t adrl, int word) {
     s_access_lead_hi = s_access_lead_lo + sl;
 }
 uint32_t interp_bridge_access_lead(uint16_t adr, uint32_t fallback) {
+    /* Bus-exact compiled code: the instruction's start is the master clock
+     * while it runs; cpu_state.c noted the access's lead. */
+    if (!s_interp_bus_timing_active && g_aot_access_prefix != AOT_NO_ACCESS) {
+        uint32_t lead;
+        return cpu_aot_access_lead(adr, &lead) ? lead : fallback;
+    }
     if (!s_interp_bus_timing_active || !s_access_adr) return fallback;
     if (adr == s_access_adr) return s_access_lead_lo;
     if (adr == (uint16_t)(s_access_adr + 1)) return s_access_lead_hi;
@@ -1048,6 +1054,37 @@ void interp_bridge_set_master_deadline(uint64_t master_clock) {
     s_lle_master_deadline = master_clock;
 }
 
+/* Bus-exact compiled code (SNESRECOMP_EXACT_BUS=1) at each instruction's start,
+ * after its deadline check: the host's per-instruction hook, as the interpreter
+ * calls it (a frame driver that judges the last instruction before an
+ * interrupt needs every one), and SNESRECOMP_CYC_WATCH's line with the start
+ * clock (the interpreter's `start=`). */
+static int s_aot_exact_seen;
+static int nested_deadline_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SNESRECOMP_NESTED_DEADLINE");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+void cpu_aot_insn_begin(const CpuState *cpu, uint32_t pc16) {
+    const uint32_t pc24 = ((uint32_t)cpu->PB << 16) | (pc16 & 0xFFFF);
+    s_aot_exact_seen = 1;
+    if (g_interp_bridge_pc_hook)
+        g_interp_bridge_pc_hook(pc24, cpu->m_flag ? 1 : 0, cpu->x_flag ? 1 : 0);
+    static int on = -1;
+    static unsigned long lo, hi;
+    if (on < 0) {
+        const char *e = getenv("SNESRECOMP_CYC_WATCH");
+        on = (e && e[0] && sscanf(e, "%lx-%lx", &lo, &hi) == 2) ? 1 : 0;
+    }
+    if (!on || pc24 < lo || pc24 > hi) return;
+    extern int snes_frame_counter;
+    fprintf(stderr, "[acyc] f=%d pc=$%06X start=%llu\n", snes_frame_counter,
+            (unsigned)pc24, (unsigned long long)cpu->master_cycles);
+}
+
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
     /* SNESRECOMP_DEADLINE_DIAG=1: report why the bound is not firing.
      *
@@ -1856,6 +1893,20 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             cpu->master_cycles >= s_lle_master_deadline) {
             lle_resume_set(pc_before, INTERP_RESUME_SITE_DEADLINE, in.sp);
             sync_interp_to_cpu(&in,cpu);
+            bridge_apu_flush(cpu);
+            return 1;
+        }
+        /* A nested run (compiled code called this routine) under bus-exact
+         * compiled code stops at the deadline as well, between the same two
+         * instructions the scheduler's own run would: the deadline unwind
+         * carries the PC out through the compiled callers to the scheduler.
+         * SNESRECOMP_NESTED_DEADLINE=0 turns it off. */
+        if (!yield_pc && s_aot_exact_seen && nested_deadline_enabled() &&
+            interp_bridge_lle_master_deadline_reached(cpu)) {
+            s_lle_next_unwind_is_deadline = 0;
+            lle_unwind_arm(pc_before, s_interp_bridge_depth - 1, 1,
+                           INTERP_RESUME_SITE_DEADLINE, in.sp);
+            sync_interp_to_cpu(&in, cpu);
             bridge_apu_flush(cpu);
             return 1;
         }
@@ -2740,6 +2791,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             g_interp_bridge_pc_hook(pc_before & 0xFFFFFFu,
                                     in.mf ? 1 : 0, in.xf ? 1 : 0);
         if (s_idle_poll_count) s_idle_poll_now = bridge_is_idle_poll(pc_before);
+        const uint64_t _cyc_start = cpu->master_cycles;
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
         s_idle_poll_now = 0;
         if (s_interp_pctrace && steps < 4)
@@ -2822,7 +2874,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             extern int snes_frame_counter;
             fprintf(stderr,
                     "[cyc] f=%d pc=$%06X op=$%02X cyc=%d bus_xfers=%u "
-                    "bus_master=%llu internal=%u master_delta=%llu now=%llu\n",
+                    "bus_master=%llu internal=%u master_delta=%llu now=%llu start=%llu\n",
                     snes_frame_counter, (unsigned)pc_before, (unsigned)op,
                     _cyc, s_interp_bus_cycles,
                     (unsigned long long)s_interp_bus_master,
@@ -2832,7 +2884,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                         (uint64_t)((unsigned)_cyc > s_interp_bus_cycles
                                        ? (unsigned)_cyc - s_interp_bus_cycles
                                        : 0) * 6u),
-                    (unsigned long long)cpu->master_cycles);
+                    (unsigned long long)cpu->master_cycles,
+                    (unsigned long long)_cyc_start);
         }
 
         if (auto_quiescent &&

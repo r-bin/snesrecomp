@@ -84,6 +84,9 @@ void ppudma_note_interrupt(int is_nmi) { (void)is_nmi; }
 uint32_t cpu_region_speed(uint32_t addr24) {
     return (uint32_t)snes_region_speed(addr24, g_memsel);
 }
+/* Bus-exact compiled code's I/O lead (cpu_state.c): no compiled code here. */
+uint32_t g_aot_access_prefix = AOT_NO_ACCESS, g_aot_access_wprefix = AOT_NO_ACCESS;
+int cpu_aot_access_lead(uint16 adr, uint32_t *lead) { (void)adr; (void)lead; return 0; }
 uint8_t sdd1_read(Sdd1 *sdd1, uint16_t addr) {
     (void)sdd1;
     (void)addr;

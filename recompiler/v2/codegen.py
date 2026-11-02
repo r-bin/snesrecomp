@@ -2739,6 +2739,11 @@ def _emit_pea_per_pei(op: PushEffectiveAddress) -> List[str]:
     return ["/* TODO PushEffectiveAddress unsupported kind */"]
 
 
+def bus_exact_enabled() -> bool:
+    from v2.bus_exact import enabled
+    return enabled()
+
+
 def _emit_blockmove(op: BlockMove) -> List[str]:
     delta = "+1" if op.direction == "mvn" else "-1"
     et = "CPU_TR_MVN" if op.direction == "mvn" else "CPU_TR_MVP"
@@ -2768,7 +2773,11 @@ def _emit_blockmove(op: BlockMove) -> List[str]:
         f"        return interp_bridge_lle_yield_unwind(cpu, {_transfer_target_expr(_CURRENT_SOURCE_PC24, False)});",
         "      }",
         "      cpu->cycles += 7;",
-        f"      cpu->master_cycles += 7 * {speed_expr};",
+        (f"      cpu->master_cycles += 42u + 3u * (({speed_expr}) - 6u)"
+         f" + cpu_region_speed(((uint32)_src_b << 16) | cpu->X) - 6u"
+         f" + cpu_region_speed(((uint32)_dst_b << 16) | cpu->Y) - 6u;"
+         if bus_exact_enabled() else
+         f"      cpu->master_cycles += 7 * {speed_expr};"),
         "    }",
         "  } while (cpu->A != 0xFFFF);",
         "}",
