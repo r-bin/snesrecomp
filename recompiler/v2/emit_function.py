@@ -35,6 +35,7 @@ from v2.decoder import (  # noqa: E402
 from v2.cfg import V2Block, V2CFG, build_cfg  # noqa: E402
 from v2.lowering import lower  # noqa: E402
 from v2.codegen import emit_op, _transfer_target_expr  # noqa: E402
+from v2 import bus_exact  # noqa: E402
 from v2.naming import (  # noqa: E402
     default_func_name as _default_func_name,
     variant_suffix as _variant_suffix,
@@ -347,7 +348,8 @@ def scan_tail_call_stack_delta(
     except Exception:
         return {}
 
-    cfg = build_cfg(graph, instruction_blocks=get_rom_mapping() == ROM_MAP_SA1)
+    cfg = build_cfg(graph, instruction_blocks=(get_rom_mapping() == ROM_MAP_SA1
+                                        or bus_exact.enabled()))
     if cfg.entry not in cfg.blocks:
         return {}
 
@@ -454,7 +456,8 @@ def scan_rts_stack_deltas(
     except Exception:
         return None
 
-    cfg = build_cfg(graph, instruction_blocks=get_rom_mapping() == ROM_MAP_SA1)
+    cfg = build_cfg(graph, instruction_blocks=(get_rom_mapping() == ROM_MAP_SA1
+                                        or bus_exact.enabled()))
     if cfg.entry not in cfg.blocks:
         return None
 
@@ -689,7 +692,8 @@ def emit_function(rom: bytes, bank: int, start: int,
     hook_by_pc24 = {pc24 & 0xFFFFFF: name
                     for pc24, name in (entry_hooks or {}).items()
                     if ((pc24 >> 16) & 0xFF) == bank}
-    cfg = build_cfg(graph, instruction_blocks=get_rom_mapping() == ROM_MAP_SA1,
+    cfg = build_cfg(graph, instruction_blocks=(get_rom_mapping() == ROM_MAP_SA1
+                                        or bus_exact.enabled()),
                     extra_leader_pcs={pc24 & 0xFFFF for pc24 in hook_by_pc24})
 
     # A tight, side-effect-free memory poll cannot execute atomically under
@@ -1562,6 +1566,12 @@ def emit_function(rom: bytes, bank: int, start: int,
                     f"(uint8)RECOMP_RETURN_SKIP_{skip}, \"{func_name}\");"
                 )
 
+            if ii in skip_emit_idx and bus_exact.enabled():
+                # The interpreter executes the elided setup instruction.
+                _pre, _ = bus_exact.plan(
+                    di_insn, ir_ops, (_blk_spd_expr, _blk_spd_const)
+                ).lines(f"{_label_for(key)[1:]}_{ii}")
+                lines.extend(_pre)
             if ii in skip_emit_idx:
                 if ii in nlr_pla_insn_indices:
                     lines.append(
@@ -1576,8 +1586,17 @@ def emit_function(rom: bytes, bank: int, start: int,
                 continue
             # Axis-2 step C dynamics: charge runtime-only modifiers (D.l != 0,
             # abs,X/Y read page-cross) for this instruction before its effect.
-            for _ln in _dynamic_charge_lines(di_insn, _blk_spd_expr):
-                lines.append(_ln)
+            _exact_post: List[str] = []
+            if bus_exact.enabled():
+                # One instruction per block: its exact bus charge, before
+                # its effect or (operand accesses) after it.
+                _pre, _exact_post = bus_exact.plan(
+                    di_insn, ir_ops, (_blk_spd_expr, _blk_spd_const)
+                ).lines(f"{_label_for(key)[1:]}_{ii}")
+                lines.extend(_pre)
+            else:
+                for _ln in _dynamic_charge_lines(di_insn, _blk_spd_expr):
+                    lines.append(_ln)
             for op in ir_ops:
                 if isinstance(op, CondBranch):
                     # Cond branch: block has TWO successors: fall-through (0)
@@ -1595,7 +1614,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                         # code runs e=0).
                         lines.append(
                             f"if ({pred}) {{ cpu->cycles += 1; "
-                            f"cpu->master_cycles += {_blk_spd_expr}; {target_stmt} }}")
+                            f"cpu->master_cycles += {'6' if bus_exact.enabled() else _blk_spd_expr}; {target_stmt} }}")
                     if fall is not None:
                         lines.append(_goto_or_return(fall, source_pc24=blk_pc24)
                                      + " /* fall-through */")
@@ -1997,6 +2016,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                     # ReadReg, ALU, Read/Write, etc. — non-terminating.
                     for ln in emit_op(op, getattr(di_insn, 'addr', None)):
                         lines.append(ln)
+            lines.extend(_exact_post)
         # NLR with no terminator IR (block IR was pure-PullReg, like
         # $01:A3CB's [PLA, PLA, fall-through]). The SKIP setter wasn't
         # injected during the per-insn loop because there was no
@@ -2247,6 +2267,8 @@ def emit_function(rom: bytes, bank: int, start: int,
         # Once per execution of the hooked instruction: after the deadline
         # check (a yield there hands the instruction, and with it the report,
         # to the interpreter) and before the block's cycles are charged.
+        if bus_exact.enabled():
+            src.append(f'    cpu_aot_insn_begin(cpu, 0x{block_pc24 & 0xFFFF:04X}u);')
         if block_pc24 in hook_by_pc24:
             src.append(f'    {hook_by_pc24[block_pc24]}(cpu, 0x{block_pc24:06X}u);')
         # Cartridge coprocessors observe CPU bus accesses no earlier than this
@@ -2262,7 +2284,7 @@ def emit_function(rom: bytes, bank: int, start: int,
         # Axis-5: also charge the region-weighted MASTER clocks (CPU cycles x
         # code-region speed) into cpu->master_cycles, which paces the SPC700.
         _cyc_const = _block_cycle_const(block_per_insn_ir.get(key, []))
-        if _cyc_const:
+        if _cyc_const and not bus_exact.enabled():
             src.append(f'    cpu->cycles += {_cyc_const};')
             _spd_expr, _spd_const = _block_speed(bank, key.pc)
             if _spd_const is not None:

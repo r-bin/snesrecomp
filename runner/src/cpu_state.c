@@ -347,6 +347,31 @@ static inline void cpu_pace_cycles_word(uint16 addr) {
     cpu_pace_cycles(addr);
 }
 
+/* Bus-exact generated code (SNESRECOMP_EXACT_BUS=1 at generation, recompiler
+ * v2/bus_exact.py): an instruction that accesses memory through an operand
+ * charges its clocks after its effect and sets these to the clocks from its
+ * start to its data access (the write of a read-modify-write: wprefix). An I/O
+ * register access in it then gets the lead the interpreter would give it. */
+uint32_t g_aot_access_prefix = AOT_NO_ACCESS;
+uint32_t g_aot_access_wprefix = AOT_NO_ACCESS;
+static uint16 s_aot_access_adr;
+static uint32_t s_aot_lead_lo, s_aot_lead_hi;
+static inline void cpu_aot_note_access(uint16 addr, int word, int write) {
+    (void)word;
+    if (g_aot_access_prefix == AOT_NO_ACCESS) return;
+    /* MesenCE's sample point: 2 clocks into the access's bus cycle. */
+    s_aot_access_adr = addr;
+    s_aot_lead_lo = (write ? g_aot_access_wprefix : g_aot_access_prefix) + 2;
+    s_aot_lead_hi = s_aot_lead_lo + cpu_region_speed(addr);
+}
+int cpu_aot_access_lead(uint16 adr, uint32_t *lead) {
+    if (g_aot_access_prefix == AOT_NO_ACCESS || !s_aot_access_adr) return 0;
+    if (adr == s_aot_access_adr) *lead = s_aot_lead_lo;
+    else if (adr == (uint16)(s_aot_access_adr + 1)) *lead = s_aot_lead_hi;
+    else return 0;
+    return 1;
+}
+
 /* Master clocks for ONE bus access at a 24-bit address (region speed).
  * Mirrors Recompiler/snes_cycles.py::region_speed exactly. The LLE
  * (interp_bridge.c bridge_region_speed) and the AOT paced accessors below
@@ -443,6 +468,7 @@ uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     if (off >= 0) return cpu_latch_read8(cpu, cpu->ram[off]);
     if (is_hw_reg(bank, addr)) {
         cpu_pace_cycles(addr);
+        cpu_aot_note_access(addr, 0, 0);
         cpu_hw_log(addr, 1, 0);
         return cpu_latch_read8(cpu, ReadRegOpenBus(addr, cpu->open_bus));
     }
@@ -492,6 +518,7 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
         uint8 lo;
         uint8 hi;
         cpu_pace_cycles_word(addr);
+        cpu_aot_note_access(addr, 1, 0);
         cpu_hw_log(addr, 1, 0);
         if (addr >= 0x2140 && addr <= 0x217F)
             return cpu_latch_read16(cpu, ReadRegWord(addr));
@@ -617,7 +644,7 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
 #endif
         return;
     }
-    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_hw_log(addr, 0, v); WriteReg(addr, v); return; }
+    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_aot_note_access(addr, 0, 1); cpu_hw_log(addr, 0, v); WriteReg(addr, v); return; }
     if (g_snes && g_snes->cart && g_snes->cart->type == CART_SUPERFX) {
         cart_write(g_snes->cart, bank, addr, v); return;
     }
@@ -704,6 +731,7 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     }
     if (is_hw_reg(bank, addr)) {
         cpu_pace_cycles_word(addr);
+        cpu_aot_note_access(addr, 1, 1);
         cpu_hw_log(addr, 0, v);
         WriteRegWord(addr, v);
         cpu->open_bus = (uint8)(v >> 8);
