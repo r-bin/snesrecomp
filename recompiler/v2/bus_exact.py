@@ -40,6 +40,13 @@ def enabled() -> bool:
     return os.environ.get('SNESRECOMP_EXACT_BUS') == '1'
 
 
+def resume_enabled() -> bool:
+    """SNESRECOMP_AOT_RESUME=1 (with bus-exact code): every instruction of a
+    variant is also an entry, so a frame suspended at a deadline resumes compiled
+    (emit_function's resume switch, program_emit's g_aot_resume_table)."""
+    return enabled() and os.environ.get('SNESRECOMP_AOT_RESUME') == '1'
+
+
 _STORE = {'STA', 'STX', 'STY', 'STZ'}
 _RMW = {'ASL', 'LSR', 'ROL', 'ROR', 'INC', 'DEC', 'TSB', 'TRB'}
 _XW = {'LDX', 'LDY', 'STX', 'STY', 'CPX', 'CPY'}
@@ -90,6 +97,7 @@ class Plan:
         self.after = False                 # charge after the effect
         self.prefix_expr: Optional[str] = None   # clocks to the data access
         self.wprefix_expr: Optional[str] = None  # to the write of an RMW
+        self.open_bus: Optional[int] = None      # the last fetch before the access
 
     def lines(self, tag: str) -> Tuple[List[str], List[str]]:
         """(lines before the effect, lines after it)."""
@@ -103,6 +111,8 @@ class Plan:
             return decl + charge, []
         pre = decl + [f"g_aot_access_prefix = {self.prefix_expr};",
                       f"g_aot_access_wprefix = {self.wprefix_expr};"]
+        if self.open_bus is not None:
+            pre.append(f"cpu->open_bus = 0x{self.open_bus:02X};")
         post = charge + ["g_aot_access_prefix = AOT_NO_ACCESS;"]
         return pre, post
 
@@ -184,9 +194,26 @@ def plan(insn, ir_ops, code_speed: Tuple[str, Optional[int]]) -> Plan:
         p.master_dyn.append(f"{nptr}u * ({_rs0(pa)} - 6u)")
         prefix.append(f"{nptr}u * {_rs0(pa)}")
 
+    # The data bus holds the last byte fetched: with no pointer read between,
+    # the operand's last byte, which an undriven register ($2137, open-bus
+    # bits) reads back, as the interpreter's fetches leave it.
+    if not nptr and insn.length >= 2:
+        p.open_bus = (operand >> (8 * (insn.length - 2))) & 0xFF
+
     bank, addr = _segref_addr_expr(seg)
     ds = _rs(bank, addr)
-    p.master_dyn.append(f"{nbytes}u * ({ds} - 6u)")
+    if width == 1:
+        p.master_dyn.append(f"{nbytes}u * ({ds} - 6u)")
+    else:
+        # A word's second byte is at the next address and is charged at its
+        # own region's speed, as the interpreter charges it: a word across a
+        # speed boundary ($xx:7FFF/$8000, the end of WRAM's low mirror) costs
+        # one byte at each speed.
+        ds_hi = (f"cpu_region_speed((((uint32)({bank}) << 16) + "
+                 f"(uint32)(uint16)({addr}) + 1u) & 0xFFFFFFu)")
+        reps = nbytes // 2
+        p.master_dyn.append(f"{reps}u * ({ds} - 6u)")
+        p.master_dyn.append(f"{reps}u * ({ds_hi} - 6u)")
 
     if x and mnem not in _STORE and mnem not in _RMW and mode in _READ_XCROSS_MODES:
         if mode == INDIR_Y:
@@ -201,7 +228,8 @@ def plan(insn, ir_ops, code_speed: Tuple[str, Optional[int]]) -> Plan:
     p.after = True
     p.prefix_expr = " + ".join(prefix)
     if mnem in _RMW:
-        p.wprefix_expr = f"{p.prefix_expr} + {width}u * {ds}"
+        rd = f"{ds}" if width == 1 else f"{ds} + {ds_hi}"
+        p.wprefix_expr = f"{p.prefix_expr} + {rd}"
     else:
         p.wprefix_expr = p.prefix_expr
     return p

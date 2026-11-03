@@ -36,6 +36,7 @@ from .decoder import (
     set_decode_cache_enabled,
 )
 from .emit_bank import BankEntry, emit_bank, _default_file_header
+from . import bus_exact
 from .link_closure import assert_closed
 from .program_analysis import NodeDisposition, ProgramManifest, VariantKey
 from .translation_units import (_TOP_LEVEL_CPU_FN_RE,
@@ -717,6 +718,50 @@ def emit_dispatch_table(manifest: ProgramManifest, emitted_variants: Mapping,
     return "\n".join(lines)
 
 
+_RESUME_FN = re.compile(r'^RecompReturn (\w+)\(CpuState \*cpu\) \{$')
+_RESUME_CASE = re.compile(r'/\* aot-resume \$([0-9A-F]{6}) m([01])x([01]) \*/$')
+
+
+def emit_aot_resume_table(sources: Iterable[pathlib.Path]) -> str:
+    """g_aot_resume_table: every instruction a generated variant can resume at
+    (the resume switch emit_function writes under SNESRECOMP_AOT_RESUME=1),
+    sorted by (pc24, mx). Collected from the bank sources so cached banks count
+    too. Where several variants hold an instruction (shared tails, a routine
+    entered mid-way), the one with the most instructions serves it: its CFG
+    follows the code furthest, so it leaves for the interpreter least. Empty
+    without the switch."""
+    keys_of = defaultdict(list)
+    for path in sorted(sources):
+        fn = None
+        for line in path.read_text().splitlines():
+            m = _RESUME_FN.match(line)
+            if m:
+                fn = m.group(1)
+                continue
+            c = _RESUME_CASE.search(line)
+            if c and fn:
+                keys_of[fn].append(
+                    (int(c.group(1), 16), (int(c.group(2)) << 1) | int(c.group(3))))
+    by_key = {}
+    for fn in sorted(keys_of, key=lambda f: (-len(keys_of[f]), f)):
+        for key in keys_of[fn]:
+            by_key.setdefault(key, fn)
+    lines = ["", "/* Compiled resume entries (SNESRECOMP_AOT_RESUME). */"]
+    for fn in sorted(set(by_key.values())):
+        lines.append(f"RecompReturn {fn}(CpuState *cpu);")
+    lines.append("const AotResumeEntry g_aot_resume_table[] = {")
+    if not by_key:
+        lines.append("    { 0xFFFFFFFFu, 0, NULL },")
+    for (pc24, mx), fn in sorted(by_key.items()):
+        lines.append(f"    {{ 0x{pc24:06X}u, {mx}, {fn} }},")
+    lines.extend([
+        "};",
+        f"const unsigned g_aot_resume_count = {len(by_key)}u;",
+        "",
+    ])
+    return "\n".join(lines)
+
+
 def _stable_hash(value) -> str:
     data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(data).hexdigest()
@@ -762,6 +807,8 @@ def _bank_cache_key(bank: int, manifest: ProgramManifest, rom_digest: str,
             if ((pc24 >> 16) & 0xFF) == bank
         ),
         "hle": bool(enable_hle),
+        # Emission switches read from the environment change every body.
+        "bus_exact": [bus_exact.enabled(), bus_exact.resume_enabled()],
         "sharding": [int(shard_threshold_bytes), int(shard_pc_span)],
         "module_prefix": module_prefix or "",
     })
@@ -1011,7 +1058,8 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
             staging / "dispatch_v2.c",
             emit_dispatch_table(manifest, emitted, name_for_pc, inline_arg_map,
                                 ram_routines=_collect_ram_routines(parsed),
-                                module_prefix=module_prefix))
+                                module_prefix=module_prefix) +
+            emit_aot_resume_table(staging / name for name in planned_bank_outputs))
         write_if_changed(
             staging / "unresolved_stubs_v2.c",
             "/* Manifest-driven generation: unresolved execution remains LLE. */\n")
