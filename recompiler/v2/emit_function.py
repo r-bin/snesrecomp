@@ -2183,6 +2183,17 @@ def emit_function(rom: bytes, bank: int, start: int,
     src.append(f'  if (cpu_take_tailcall_return_context(&_entry_s, &_hrv)) {{')
     src.append(f'    cpu->host_return_valid = _hrv;')
     src.append(f'  }}')
+    # Compiled resume: a frame suspended at a deadline comes back through this
+    # prologue with its own entry S and return contract, then jumps to the
+    # instruction it stopped at (the switch after the entry-S record below).
+    # Not for variants that yield to the LLE scheduler at entry: they would
+    # yield before taking the resume. Not for interrupt handlers either: their
+    # RTI discards the popped PC and returns to a host that knows where the
+    # interrupted code goes on, which a resumed frame's caller does not.
+    has_rti = any('CPU_TR_RTI' in ln for lines in block_lines.values() for ln in lines)
+    resume = bus_exact.resume_enabled() and not has_lle_memory_poll and not has_rti
+    if resume:
+        src.append(f'  const uint32 _aot_resume = cpu_take_aot_resume(&_entry_s, &_hrv);')
     # Debug bisection guard (codegen-flag gated): after the prologue has
     # established the ACTUAL invocation's _entry_s/_hrv (incl. tail-call
     # context), tier the whole body to the interpreter if this node's PC is in
@@ -2225,6 +2236,19 @@ def emit_function(rom: bytes, bank: int, start: int,
     # resolved to a SKIP_N non-local return (cpu_resolve_ancestor_skip).
     # Index by the just-pushed g_recomp_stack_top; pop is implicit (top--).
     src.append(f'  if (g_recomp_stack_top >= 1) g_cpu_entry_s[g_recomp_stack_top - 1] = _entry_s;')
+    if resume:
+        # One case per instruction, keyed by (pc16, m, x) as the label is; the
+        # trailing comment is what program_emit collects into g_aot_resume_table.
+        src.append('  if (_aot_resume) {')
+        src.append('    switch ((((_aot_resume & 0xFFFFu) << 2) | ((cpu->m_flag & 1u) << 1) | (cpu->x_flag & 1u))) {')
+        for key in block_order:
+            pc16 = key.pc & 0xFFFF
+            src.append(f'      case 0x{(pc16 << 2) | (key.m << 1) | key.x:X}u: goto {_label_for(key)};'
+                       f'  /* aot-resume ${(bank << 16) | pc16:06X} m{key.m}x{key.x} */')
+        src.append('      default: cpu_aot_resume_miss(cpu, ((_aot_resume & 0xFFFFu) << 2) | '
+                   '((cpu->m_flag & 1u) << 1) | (cpu->x_flag & 1u));')
+        src.append('    }')
+        src.append('  }')
     # `entry_hook`: observational host callbacks (docs/ENTRY_HOOK.md).
     for hook_name in sorted({hook_by_pc24[(bank << 16) | (key.pc & 0xFFFF)]
                              for key in block_order
