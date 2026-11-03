@@ -728,7 +728,10 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
        * clocked native reads have the same contract, without changing APU
        * ownership through g_interp_apu_driving. */
       extern int g_interp_apu_driving;
-      if (!g_interp_apu_driving && !snes->cpuReadClocked)
+      /* Bus-exact compiled code (an access prefix is set) keeps the beam on its own clock, as the interpreter
+       * does: no polling tick for it either. */
+      extern uint32_t g_aot_access_prefix;
+      if (!g_interp_apu_driving && !snes->cpuReadClocked && g_aot_access_prefix == 0xFFFFFFFFu /* AOT_NO_ACCESS */)
         snes_advance_beam(snes, 64, false);
       // Bit 7 = vblank. The real frame loop drives vblank via inNmi, not
       // inVblank (inVblank is never set true), so on the static-recomp

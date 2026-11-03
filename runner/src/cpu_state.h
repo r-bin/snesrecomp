@@ -806,6 +806,10 @@ int interp_bridge_in_lle_scheduler(void);
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu);
 int interp_bridge_lle_unwind_pending(void);
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24);
+/* A compiled RTI. Under a host-delivered interrupt (interp_bridge_run_interrupt) the RTI is the host boundary:
+ * RECOMP_RETURN_NORMAL. Under the scheduler (an NMI run as an ordinary slice) it goes on at the popped PB:PC, as
+ * the interpreter's RTI does. */
+RecompReturn interp_bridge_aot_rti(CpuState *cpu, uint32 popped_pc24);
 uint32 interp_bridge_lle_resume_pc(void);
 void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
                                               size_t count);
