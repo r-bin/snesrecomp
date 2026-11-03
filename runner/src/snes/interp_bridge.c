@@ -1326,6 +1326,15 @@ int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
     return reached;
 }
 
+RecompReturn interp_bridge_aot_rti(CpuState *cpu, uint32 popped_pc24) {
+    if (s_interp_bridge_depth > 0 && s_interp_owner_is_scheduler) {
+        /* The handler's frame is done, not suspended: nothing to resume later. */
+        s_aot_captured = 1;
+        return interp_bridge_lle_yield_unwind(cpu, popped_pc24 & 0xFFFFFFu);
+    }
+    return RECOMP_RETURN_NORMAL;
+}
+
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24) {
     /* DIAGNOSTIC (SNESRECOMP_TRAP_YIELD=<lo>-<hi> hex pc24 range): print every
      * LLE yield unwind whose resume PC falls in the range, with the live guest
@@ -3654,6 +3663,9 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
                               reset_cap_on_bounce, stop_pcs, n_stop,
                               stop_on_rti);
     g_interp_wlog_pc24 = 0;  /* control returns to compiled code */
+    /* Back to the host: the beam to the CPU's clock, however the run ended (compiled code advances it only at
+     * its own sync points; the host reads the beam for its next slice's line grid and its beam-gated events). */
+    if (s_interp_bridge_depth == 1 && g_snes) snes_sync_master_clock(g_snes, cpu->master_cycles);
     s_tier_entry = _saved_tier_entry;
     RecompStackPop();
     g_last_recomp_func = _saved_func;

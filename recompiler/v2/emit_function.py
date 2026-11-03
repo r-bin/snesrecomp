@@ -2187,11 +2187,9 @@ def emit_function(rom: bytes, bank: int, start: int,
     # prologue with its own entry S and return contract, then jumps to the
     # instruction it stopped at (the switch after the entry-S record below).
     # Not for variants that yield to the LLE scheduler at entry: they would
-    # yield before taking the resume. Not for interrupt handlers either: their
-    # RTI discards the popped PC and returns to a host that knows where the
-    # interrupted code goes on, which a resumed frame's caller does not.
-    has_rti = any('CPU_TR_RTI' in ln for lines in block_lines.values() for ln in lines)
-    resume = bus_exact.resume_enabled() and not has_lle_memory_poll and not has_rti
+    # yield before taking the resume. Interrupt handlers resume too: under the
+    # scheduler their RTI goes on at the popped PC (interp_bridge_aot_rti).
+    resume = bus_exact.resume_enabled() and not has_lle_memory_poll
     if resume:
         src.append(f'  const uint32 _aot_resume = cpu_take_aot_resume(&_entry_s, &_hrv);')
     # Debug bisection guard (codegen-flag gated): after the prologue has
