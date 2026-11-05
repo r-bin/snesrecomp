@@ -29,7 +29,33 @@ work normally driven by the framework timeline, including:
 - APU catch-up at a cadence that does not depend on one frame-sized catch-up
   call.
 
+Choose one owner for the read-clear `$4210.7` (RDNMI) edge as well. Beam-owned
+hosts keep the default `snes_set_rdnmi_beam_enabled(true)`. A custom frame host
+that supplies its own `snes->inNmi` pulse selects
+`snes_set_rdnmi_beam_enabled(false)` during setup. Otherwise a guest can consume
+the manual pulse, then observe a second beam-latched edge before the next
+host frame refreshes input. Manual hosts must supply their edge independently
+of NMITIMEN; that register controls interrupt delivery, not RDNMI visibility.
+
+This selects ownership rather than disabling beam progression. IRQ/HDMA,
+joypad timing and raster field observers retain their existing behavior.
+Reading RDNMI still clears both pending fields; a stale serialized beam latch
+is ignored under manual ownership. The choice is host configuration outside
+guest save states: select it when setting up a host and restore the proper
+policy when switching host models in the same process.
+
 ## Beam-Aligned Driver and the Raster Journal
+
+Independently clocked native reads must not also take HVBJOY's legacy
+64-master-clock polling step. The `cpu_read8_paced` / `cpu_read16_paced`
+accessors establish a clocked read scope automatically; `ReadRegOpenBus`
+synchronizes `$4212` to that charged master clock. A custom per-access host
+using raw register dispatch can bracket the read with
+`snes_set_cpu_read_clocked(snes, true)`, synchronize its beam to the charged
+read clock, and restore the returned previous scope afterward. This host
+scope is excluded from snapshots and does not change APU ownership.
+Ordinary block-clocked raw reads retain their polling step. Selecting this
+scope alone does not establish compiled/interpreted instruction-cycle parity.
 
 `runner/src/beam_frame_driver.h` is the framework's driver for whole-program
 LLE ports, and what `tools/new_project` scaffolds call. One host frame is one
@@ -56,6 +82,15 @@ with `ppu_rasterRenderBegin`, `ppu_rasterApplyLine` per line and
 `ppu_rasterRenderEnd`, which reapplies the writes made since the field ended.
 
 ## APU Pacing
+
+Whole-program hosts using the beam driver must wire its `state_save`,
+`state_load`, `state_loaded`, `state_identity` and `state_preflight` callbacks
+into `RtlGameInfo`, as the current scaffold does, and use its reset hook for
+both session and hardware reset. The device-only RTLS stream does not contain
+the recompiled CPU registers or execution cursor. The guarded beam-driver
+extension preserves those, the bridge's scheduling context and beam debt.
+Device-only or malformed states are rejected before restoration. The chunk
+is build-specific; old-state conversion is not part of this contract.
 
 `snes_catchupApu()` has a per-call runaway clamp. That guard assumes callers
 catch up regularly; a host that batches an entire frame into one call can discard

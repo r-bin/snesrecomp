@@ -96,11 +96,10 @@ static void ppu_render_pixel(Ppu *ppu, int x, int y) {
   if (!PPU_forcedBlank(ppu)) {
     int mainLayer = ppu_resolve_pixel(ppu, x, y, false, &r, &g, &b);
     bool colorWindowState = ppu_window_contains(ppu, 5, x);
-    if (
-      PPU_clipMode(ppu) == 3 ||
+    bool colorClipped = PPU_clipMode(ppu) == 3 ||
       (PPU_clipMode(ppu) == 2 && colorWindowState) ||
-      (PPU_clipMode(ppu) == 1 && !colorWindowState)
-      ) {
+      (PPU_clipMode(ppu) == 1 && !colorWindowState);
+    if (colorClipped) {
       r = 0;
       g = 0;
       b = 0;
@@ -126,7 +125,7 @@ static void ppu_render_pixel(Ppu *ppu, int x, int y) {
         g += (PPU_addSubscreen(ppu) && secondLayer != 5) ? g2 : PPU_fixedColorG(ppu);
         b += (PPU_addSubscreen(ppu) && secondLayer != 5) ? b2 : PPU_fixedColorB(ppu);
       }
-      if (PPU_halfColor(ppu) && (secondLayer != 5 || !PPU_addSubscreen(ppu))) {
+      if (PPU_halfColor(ppu) && !colorClipped && (secondLayer != 5 || !PPU_addSubscreen(ppu))) {
         r >>= 1;
         g >>= 1;
         b >>= 1;
@@ -144,9 +143,9 @@ static void ppu_render_pixel(Ppu *ppu, int x, int y) {
   }
   int row = y - 1;
   uint8 *pixelBuffer = (uint8 *)&ppu->renderBuffer[row * ppu->renderPitch + (x + ppu->extraLeftRight) * 4];
-  pixelBuffer[0] = ((b << 3) | (b >> 2)) * PPU_brightness(ppu) / 15;
-  pixelBuffer[1] = ((g << 3) | (g >> 2)) * PPU_brightness(ppu) / 15;
-  pixelBuffer[2] = ((r << 3) | (r >> 2)) * PPU_brightness(ppu) / 15;
+  pixelBuffer[0] = ppu_brightness_level((unsigned)b, PPU_brightness(ppu));
+  pixelBuffer[1] = ppu_brightness_level((unsigned)g, PPU_brightness(ppu));
+  pixelBuffer[2] = ppu_brightness_level((unsigned)r, PPU_brightness(ppu));
   pixelBuffer[3] = 0;
 }
 
