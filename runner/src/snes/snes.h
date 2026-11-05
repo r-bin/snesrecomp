@@ -43,6 +43,10 @@ struct Snes {
   // the frozen hPos..divideResult blob so older snapshots keep their layout.
   bool rdnmiPending;
 
+  // Host read scope, not guest state. The caller has charged this access to
+  // its master clock; HVBJOY must not add the legacy polling advance too.
+  bool cpuReadClocked;
+
   // Host timing anchor; excluded from savestates and reconciled after load.
   uint64_t beamMasterLast;
 
@@ -136,6 +140,14 @@ void snes_saveload(Snes *snes, SaveLoadInfo *sli);
 void snes_catchupApu(Snes *snes);
 void snes_advance_master_cycles(Snes *snes, uint32_t clocks);
 void snes_sync_master_clock(Snes *snes, uint64_t master_clock);
+/* Scope an independently clocked CPU read. Restore the returned value after
+ * dispatch. The caller must synchronize the beam to the charged read clock;
+ * ReadRegOpenBus does this for HVBJOY when this scope is active. */
+static inline bool snes_set_cpu_read_clocked(Snes *snes, bool clocked) {
+  bool previous = snes->cpuReadClocked;
+  snes->cpuReadClocked = clocked;
+  return previous;
+}
 /* A host that drives the beam itself (its own per-opcode hPos/vPos walk)
  * must install this: a $420B DMA's guest time is charged through it, and the
  * default (SnesInit installs one) advances g_cpu.master_cycles and syncs the
@@ -160,6 +172,10 @@ void snes_set_hdma_beam_enabled(Snes *snes, bool enabled);
  * frame, freezing the guest. Default: enabled (the beam latches). Host policy,
  * not guest state: kept out of the Snes struct and so out of savestates. */
 void snes_set_raster_irq_beam_enabled(bool enabled);
+/* RDNMI ownership is independent of IRQ/HDMA and field observers. Frame
+ * hosts supplying inNmi pulses select false at setup to avoid a second beam
+ * edge. Default true; host policy, outside serialized guest state. */
+void snes_set_rdnmi_beam_enabled(bool enabled);
 bool snes_next_irq_master(const Snes *snes, uint64_t now, uint64_t *out);
 
 /* Master clocks from the current beam position to the next programmed H/V IRQ

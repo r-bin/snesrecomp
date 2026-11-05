@@ -215,6 +215,9 @@ void interp_bridge_set_lle_resume_pc(uint32_t pc);
  * bridge's business, and the caller only has to store and hand it back.
  */
 size_t interp_bridge_rb_state_size(void);
+#define INTERP_BRIDGE_STATE_CAPACITY 1024u
+/* Read-only validation before restoring a persisted execution context. */
+bool   interp_bridge_rb_state_valid(const void *in, size_t size);
 void   interp_bridge_rb_state_save(void *out);
 void   interp_bridge_rb_state_load(const void *in);
 
@@ -241,6 +244,7 @@ void interp_bridge_reset_dynamic_cache(void);
  * architecturally interruptible instructions use this at their legal byte
  * boundaries before unwinding to the owning interpreter. */
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu);
+int interp_bridge_lle_unwind_pending(void);
 
 /* Execute an architectural interrupt handler through its terminal RTI. The
  * caller has already materialized the hardware interrupt frame. */

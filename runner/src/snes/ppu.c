@@ -165,9 +165,21 @@ void PpuResetWidescreenOamHistory(Ppu *ppu) {
   memset(ppu->wsOamMotionGrace, 0, sizeof(ppu->wsOamMotionGrace));
 }
 
+#define PPU_PORT_FIELDS(F) \
+  F(vramPointer) F(vramReadBuffer) F(vramIncrementOnHigh) F(vramRemapMode) \
+  F(vramIncrement) F(cgramPointer) F(cgramSecondWrite) F(cgramBuffer) \
+  F(scrollPrev) F(scrollPrev2) F(m7prev) F(mosaicStartLine) \
+  F(m7startX) F(m7startY) F(hCount) F(vCount) F(hCountSecond) \
+  F(vCountSecond) F(countersLatched) F(timeOver) F(rangeOver) F(evenFrame) \
+  F(frameOverscan) F(frameInterlace)
+
 void ppu_rb_residue_get(const Ppu *ppu, PpuRollbackResidue *out) {
   if (!ppu || !out)
     return;
+  memset(out, 0, sizeof(*out));
+#define GET_PORT(field) out->field = ppu->field;
+  PPU_PORT_FIELDS(GET_PORT)
+#undef GET_PORT
   out->oamAdr = ppu->oamAdr;
   out->oamInHigh = ppu->oamInHigh ? 1u : 0u;
   out->oamSecondWrite = ppu->oamSecondWrite ? 1u : 0u;
@@ -182,6 +194,9 @@ void ppu_rb_residue_get(const Ppu *ppu, PpuRollbackResidue *out) {
 void ppu_rb_residue_set(Ppu *ppu, const PpuRollbackResidue *in) {
   if (!ppu || !in)
     return;
+#define SET_PORT(field) ppu->field = in->field;
+  PPU_PORT_FIELDS(SET_PORT)
+#undef SET_PORT
   ppu->oamAdr = in->oamAdr;
   ppu->oamInHigh = in->oamInHigh != 0u;
   ppu->oamSecondWrite = in->oamSecondWrite != 0u;
@@ -192,6 +207,7 @@ void ppu_rb_residue_set(Ppu *ppu, const PpuRollbackResidue *in) {
   memcpy(ppu->wsOamMotionSeen, in->wsOamMotionSeen, sizeof(in->wsOamMotionSeen));
   memcpy(ppu->wsOamMotionGrace, in->wsOamMotionGrace, sizeof(in->wsOamMotionGrace));
 }
+#undef PPU_PORT_FIELDS
 
 // Debug layer isolation: SNESRECOMP_LAYER_MASK is a bitmask of layers to keep
 // (bit0=BG1 .. bit3=BG4, bit4=OBJ). Host-only render filter — never serialized,
@@ -699,11 +715,14 @@ static inline void ClearBackdrop(const Ppu *ppu, PpuPixelPrioBufs *buf) {
 
 // mosaicModulo is sized for the logical 256-wide screen, but widescreen window
 // edges can fall in the border (negative on the left, >=256 on the right).
-// Clamp the lookup so the rare mosaic+widescreen combination stays in-bounds;
-// border mosaic alignment is approximate but never reads out of range. With
-// extra==0 (authentic) every index is already in [0,256), so this is a no-op.
-static inline uint8 PpuMosaicAt(Ppu *ppu, int i) {
-  return ppu->mosaicModulo[(unsigned)i < (unsigned)kPpuXPixels ? i : (i < 0 ? 0 : kPpuXPixels - 1)];
+// Extend the same mosaic grid periodically there. Clamping the coordinate
+// can make a window's first mosaic span nonpositive and overrun its buffer.
+static inline int PpuMosaicAt(Ppu *ppu, int i) {
+  if ((unsigned)i < (unsigned)kPpuXPixels) return ppu->mosaicModulo[i];
+  int size = PPU_mosaicSize(ppu);
+  int remainder = i % size;
+  if (remainder < 0) remainder += size;
+  return i - remainder;
 }
 
 /* Frame of the last OAM ring snapshot; see the note in ppu_runLine. Debug
@@ -783,7 +802,7 @@ static bool PpuOptimizedRendererHandlesMode(uint mode) {
   return mode <= 3 || mode == 7;
 }
 
-static void PpuPrepareMosaic(Ppu *ppu) {
+static void PpuUpdateMosaicTable(Ppu *ppu) {
   if (PPU_mosaicSize(ppu) != ppu->lastMosaicModulo) {
     int mod = PPU_mosaicSize(ppu);
     ppu->lastMosaicModulo = mod;
@@ -792,18 +811,24 @@ static void PpuPrepareMosaic(Ppu *ppu) {
       j = (j + 1 == mod ? 0 : j + 1);
     }
   }
+}
+
+static void PpuPrepareMosaic(Ppu *ppu) {
+  PpuUpdateMosaicTable(ppu);
   ppu->mosaicStartLine = 1;
 }
 
 static void PpuDrawVisibleLine(Ppu *ppu, int line, bool pixels, bool live) {
   PPU_T0_DECL
+  /* Frame-model and detached callers can start directly on a visible line. */
+  PpuUpdateMosaicTable(ppu);
   // Cache the brightness computation.
   if (PPU_brightness(ppu) != ppu->lastBrightnessMult) {
     uint8_t ppu_brightness = PPU_brightness(ppu);
     ppu->lastBrightnessMult = ppu_brightness;
     for (int i = 0; i < 32; i++)
       ppu->brightnessMultHalf[i * 2] = ppu->brightnessMultHalf[i * 2 + 1] = ppu->brightnessMult[i] =
-      ((i << 3) | (i >> 2)) * ppu_brightness / 15;
+      ppu_brightness_level((unsigned)i, ppu_brightness);
     memset(&ppu->brightnessMult[32], ppu->brightnessMult[31], 31);
   }
 
@@ -1788,6 +1813,7 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
     int sx = win.edges[windex];
+    if (win.edges[windex + 1] <= sx) continue;
     int ws_sx = sx;
     PpuZbufType *dstz = dstbuf->data + sx + kPpuExtraLeftRight;
     PpuZbufType *dstz_end = dstbuf->data + win.edges[windex + 1] + kPpuExtraLeftRight;
@@ -2082,6 +2108,7 @@ static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, PpuPixelPrioBufs *dstbuf, in
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
     int sx = win.edges[windex];
+    if (win.edges[windex + 1] <= sx) continue;
     PpuZbufType *dstz = dstbuf->data + sx + kPpuExtraLeftRight;
     PpuZbufType *dstz_end = dstbuf->data + win.edges[windex + 1] + kPpuExtraLeftRight;
     uint x = sx + ppu->hScroll[layer];
@@ -2329,6 +2356,17 @@ static void PpuFinishBackgroundOverlay(Ppu *ppu, uint y, bool sub,
   }
 }
 
+/* Modes 2 and 3 (and the hardware's 4-6) order the layers
+ *   OBJ3, BG1.hi, OBJ2, BG2.hi, OBJ1, BG1.lo, OBJ0, BG2.lo
+ * -- unlike mode 1, where BG1.hi/BG2.hi both sit above OBJ2 and BG1.lo/BG2.lo
+ * both above OBJ1. With mode 1's bases a priority-1 sprite vanished behind a
+ * low-priority BG1 tile. Sprite levels stay 14/10/6/2; the BG bases slot
+ * between them. */
+enum {
+  kMode23Bg1Hi = 0xc000, kMode23Bg2Hi = 0x8100,
+  kMode23Bg1Lo = 0x4000, kMode23Bg2Lo = 0x1100,
+};
+
 static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
   PPU_T0_DECL
   // Top 4 bits contain the prio level, and bottom 4 bits the layer type.
@@ -2413,17 +2451,17 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
   } else if (PPU_mode(ppu) == 2) {
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, true);
-    PpuDrawBackground_4bpp_opt(ppu, y, sub, 0, 0xc000, 0x8000);
-    PpuDrawBackground_4bpp_opt(ppu, y, sub, 1, 0xb100, 0x7100);
+    PpuDrawBackground_4bpp_opt(ppu, y, sub, 0, kMode23Bg1Hi, kMode23Bg1Lo);
+    PpuDrawBackground_4bpp_opt(ppu, y, sub, 1, kMode23Bg2Hi, kMode23Bg2Lo);
   } else if (PPU_mode(ppu) == 3) {
     if (ppu->lineHasSprites) { PPU_T0; PpuDrawSprites(ppu, y, sub, true); PPU_ACC(g_ppu_sec_spr_ms); }
-    PpuDrawBackground_8bpp(ppu, y, sub, 0, 0xc000, 0x8000);
+    PpuDrawBackground_8bpp(ppu, y, sub, 0, kMode23Bg1Hi, kMode23Bg1Lo);
     if (PPU_bigTiles(ppu, 1))
       PpuDrawBackgroundBig(ppu, &ppu->bgBuffers[sub], y, sub, 1, 4,
-                           0xb100, 0x7100, false);
+                           kMode23Bg2Hi, kMode23Bg2Lo, false);
     else
       PpuDrawBackground_4bpp(ppu, &ppu->bgBuffers[sub], y, sub, 1,
-                             0xb100, 0x7100);
+                             kMode23Bg2Hi, kMode23Bg2Lo);
   } else {
     // mode 7
     PpuPixelPrioBufs *layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 0);
@@ -2548,7 +2586,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
         }
       } while (dst++, ++i < right);
     } else {
-      uint8 *half_color_map = PPU_halfColor(ppu) ? ppu->brightnessMultHalf : ppu->brightnessMult;
+      uint8 *half_color_map = (PPU_halfColor(ppu) && clip_color_mask) ? ppu->brightnessMultHalf : ppu->brightnessMult;
       // Store this in locals
       math_enabled_cur |= PPU_addSubscreen(ppu) << 8 | PPU_subtractColor(ppu) << 9;
       // Need to check for each pixel whether to use math or not based on the main screen layer.
@@ -3462,6 +3500,62 @@ void ppu_rasterRenderEnd(Ppu *ppu) {
   ppu->oamInHigh = s_raster_port.oamInHigh;
   ppu->oamSecondWrite = s_raster_port.oamSecondWrite;
   ppu->oamBuffer = s_raster_port.oamBuffer;
+}
+
+typedef struct {
+  uint32_t magic, size, current, armed, completed;
+  PpuRasterField field[2];
+} PpuRasterState;
+#define PPU_RASTER_STATE_MAGIC 0x31524a50u /* PJR1 */
+
+size_t ppu_rasterStateSize(void) { return sizeof(PpuRasterState); }
+
+bool ppu_rasterStateValid(const void *data, size_t size) {
+  if (!data || size != sizeof(PpuRasterState)) return false;
+  PpuRasterState state;
+  memcpy(&state, data, sizeof state);
+  if (state.magic != PPU_RASTER_STATE_MAGIC || state.size != sizeof state ||
+      state.current > 1 || state.armed > 1 || state.completed > 1) return false;
+  for (unsigned f = 0; f < 2; ++f) {
+    const PpuRasterField *field = &state.field[f];
+    if (field->count < 0 || field->count > PPU_RASTER_MAX) return false;
+    for (int i = 0; i < field->count; ++i)
+      if (field->e[i].key >= 262 || !raster_reg_journaled(field->e[i].reg))
+        return false;
+  }
+  return true;
+}
+
+bool ppu_rasterStateSave(SaveLoadInfo *sli) {
+  if (s_raster_rendering) return false;
+  PpuRasterState state = {0};
+  state.magic = PPU_RASTER_STATE_MAGIC;
+  state.size = sizeof state;
+  state.current = s_raster_armed ? s_raster_cur : 0;
+  state.armed = s_raster_armed;
+  state.completed = s_raster_armed ? s_raster_have_completed : 0;
+  if (s_raster_armed) for (unsigned f = 0; f < 2; ++f) {
+    if (!s_raster_have_completed && f != (unsigned)s_raster_cur) continue;
+    state.field[f] = s_field[f];
+    /* Unused entries belong to discarded fields, not this snapshot. */
+    memset(state.field[f].e + state.field[f].count, 0,
+           (PPU_RASTER_MAX - state.field[f].count) * sizeof(PpuRasterEntry));
+  }
+  sli->func(sli, &state, sizeof state);
+  return true;
+}
+
+bool ppu_rasterStateLoad(SaveLoadInfo *sli) {
+  PpuRasterState state;
+  sli->func(sli, &state, sizeof state);
+  if (!ppu_rasterStateValid(&state, sizeof state)) return false;
+  memcpy(s_field, state.field, sizeof s_field);
+  s_raster_cur = state.current;
+  s_raster_armed = state.armed;
+  s_raster_have_completed = state.completed;
+  s_raster_rendering = s_raster_next = s_raster_hdmaen_pending = 0;
+  s_raster_render = NULL;
+  return true;
 }
 
 /* Snapshot of the journal as the renderer will consume it, for the debug

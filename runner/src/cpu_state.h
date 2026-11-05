@@ -452,6 +452,11 @@ static inline void cpu_push_interrupt_frame_at(CpuState *cpu, uint32 pc24) {
     cpu_write8(cpu, 0x00, cpu->S, (uint8)(pc24 >> 8)); cpu->S = (uint16)(cpu->S - 1);  /* PCH */
     cpu_write8(cpu, 0x00, cpu->S, (uint8)pc24); cpu->S = (uint16)(cpu->S - 1);  /* PCL */
     cpu_write8(cpu, 0x00, cpu->S, cpu->P); cpu->S = (uint16)(cpu->S - 1);
+    /* Preserve the interrupted flags in the frame, then enter the handler
+     * with IRQ masked and binary arithmetic. RTI restores the saved P. */
+    cpu->_flag_I = 1;
+    cpu->_flag_D = 0;
+    cpu->P = (uint8)((cpu->P | 0x04u) & ~0x08u);
 }
 
 /* Generated host-C control flow has no runtime PC offset. Its generated RTI
@@ -764,6 +769,7 @@ RecompReturn interp_tier_dispatch_bank_miss(CpuState *cpu, uint32 addr_pc24,
 #define RECOMP_RETURN_LLE_UNWIND_BASE 0x40000000
 int interp_bridge_in_lle_scheduler(void);
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu);
+int interp_bridge_lle_unwind_pending(void);
 RecompReturn interp_bridge_lle_yield_unwind(CpuState *cpu, uint32 resume_pc24);
 uint32 interp_bridge_lle_resume_pc(void);
 void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
