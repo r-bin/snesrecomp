@@ -219,6 +219,12 @@ static void bridge_note_access(uint32_t adrl, int word) {
     s_access_lead_hi = s_access_lead_lo + sl;
 }
 uint32_t interp_bridge_access_lead(uint16_t adr, uint32_t fallback) {
+    /* Bus-exact compiled code: the instruction's start is the master clock
+     * while it runs; cpu_state.c noted the access's lead. */
+    if (!s_interp_bus_timing_active && g_aot_access_prefix != AOT_NO_ACCESS) {
+        uint32_t lead;
+        return cpu_aot_access_lead(adr, &lead) ? lead : fallback;
+    }
     if (!s_interp_bus_timing_active || !s_access_adr) return fallback;
     if (adr == s_access_adr) return s_access_lead_lo;
     if (adr == (uint16_t)(s_access_adr + 1)) return s_access_lead_hi;
@@ -1048,6 +1054,79 @@ void interp_bridge_set_master_deadline(uint64_t master_clock) {
     s_lle_master_deadline = master_clock;
 }
 
+/* Bus-exact compiled code (SNESRECOMP_EXACT_BUS=1) at each instruction's start,
+ * after its deadline check: the host's per-instruction hook, as the interpreter
+ * calls it (a frame driver that judges the last instruction before an
+ * interrupt needs every one), and SNESRECOMP_CYC_WATCH's line with the start
+ * clock (the interpreter's `start=`). */
+static int s_aot_exact_seen;
+
+/* SNESRECOMP_TIER_STATS=1: how many instructions each tier ran, printed at
+ * exit, and the interpreted runs that ran the most (by the PC each run
+ * started at: a routine called from compiled code, or where the scheduler
+ * resumed). Compiled instructions are counted in bus-exact code only
+ * (cpu_aot_insn_begin). */
+static int s_tier_stats = -1;
+static uint64_t s_tier_aot, s_tier_interp;
+static uint32_t *s_tier_entry_counts;   /* interpreted instructions per run entry PC */
+static uint32_t s_tier_entry = 0xFFFFFFFFu;
+static int tier_cmp(const void *a, const void *b) {
+    const uint32_t x = s_tier_entry_counts[*(const uint32_t *)a];
+    const uint32_t y = s_tier_entry_counts[*(const uint32_t *)b];
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+static void tier_stats_print(void) {
+    const uint64_t all = s_tier_aot + s_tier_interp;
+    fprintf(stderr, "[tier] compiled %llu interpreted %llu instructions: %.2f %% native\n",
+            (unsigned long long)s_tier_aot, (unsigned long long)s_tier_interp,
+            all ? 100.0 * (double)s_tier_aot / (double)all : 0.0);
+    if (!s_tier_entry_counts) return;
+    static uint32_t pcs[1u << 16];
+    int n = 0;
+    for (uint32_t pc = 0; pc < 0x1000000u && n < (int)(1u << 16); pc++)
+        if (s_tier_entry_counts[pc]) pcs[n++] = pc;
+    qsort(pcs, (size_t)n, sizeof pcs[0], tier_cmp);
+    for (int i = 0; i < n && i < 40; i++)
+        fprintf(stderr, "[tier] interpreted from $%06X: %u instructions (%.2f %%)\n", (unsigned)pcs[i],
+                s_tier_entry_counts[pcs[i]], all ? 100.0 * s_tier_entry_counts[pcs[i]] / (double)all : 0.0);
+}
+static int tier_stats_on(void) {
+    if (s_tier_stats < 0) {
+        const char *e = getenv("SNESRECOMP_TIER_STATS");
+        s_tier_stats = e && e[0] == '1';
+        if (s_tier_stats) {
+            s_tier_entry_counts = (uint32_t *)calloc(0x1000000u, sizeof(uint32_t));
+            atexit(tier_stats_print);
+        }
+    }
+    return s_tier_stats;
+}
+static int nested_deadline_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SNESRECOMP_NESTED_DEADLINE");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+void cpu_aot_insn_begin(const CpuState *cpu, uint32_t pc16) {
+    const uint32_t pc24 = ((uint32_t)cpu->PB << 16) | (pc16 & 0xFFFF);
+    s_aot_exact_seen = 1;
+    if (tier_stats_on()) s_tier_aot++;
+    if (g_interp_bridge_pc_hook)
+        g_interp_bridge_pc_hook(pc24, cpu->m_flag ? 1 : 0, cpu->x_flag ? 1 : 0);
+    static int on = -1;
+    static unsigned long lo, hi;
+    if (on < 0) {
+        const char *e = getenv("SNESRECOMP_CYC_WATCH");
+        on = (e && e[0] && sscanf(e, "%lx-%lx", &lo, &hi) == 2) ? 1 : 0;
+    }
+    if (!on || pc24 < lo || pc24 > hi) return;
+    extern int snes_frame_counter;
+    fprintf(stderr, "[acyc] f=%d pc=$%06X start=%llu\n", snes_frame_counter,
+            (unsigned)pc24, (unsigned long long)cpu->master_cycles);
+}
+
 int interp_bridge_lle_master_deadline_reached(const CpuState *cpu) {
     /* SNESRECOMP_DEADLINE_DIAG=1: report why the bound is not firing.
      *
@@ -1856,6 +1935,20 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             cpu->master_cycles >= s_lle_master_deadline) {
             lle_resume_set(pc_before, INTERP_RESUME_SITE_DEADLINE, in.sp);
             sync_interp_to_cpu(&in,cpu);
+            bridge_apu_flush(cpu);
+            return 1;
+        }
+        /* A nested run (compiled code called this routine) under bus-exact
+         * compiled code stops at the deadline as well, between the same two
+         * instructions the scheduler's own run would: the deadline unwind
+         * carries the PC out through the compiled callers to the scheduler.
+         * SNESRECOMP_NESTED_DEADLINE=0 turns it off. */
+        if (!yield_pc && s_aot_exact_seen && nested_deadline_enabled() &&
+            interp_bridge_lle_master_deadline_reached(cpu)) {
+            s_lle_next_unwind_is_deadline = 0;
+            lle_unwind_arm(pc_before, s_interp_bridge_depth - 1, 1,
+                           INTERP_RESUME_SITE_DEADLINE, in.sp);
+            sync_interp_to_cpu(&in, cpu);
             bridge_apu_flush(cpu);
             return 1;
         }
@@ -2740,6 +2833,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             g_interp_bridge_pc_hook(pc_before & 0xFFFFFFu,
                                     in.mf ? 1 : 0, in.xf ? 1 : 0);
         if (s_idle_poll_count) s_idle_poll_now = bridge_is_idle_poll(pc_before);
+        const uint64_t _cyc_start = cpu->master_cycles;
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
         s_idle_poll_now = 0;
         if (s_interp_pctrace && steps < 4)
@@ -2773,6 +2867,10 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                ? (unsigned)_cyc - s_interp_bus_cycles : 0;
             uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
             g_interp_bridge_steps++;
+            if (tier_stats_on()) {
+                s_tier_interp++;
+                if (s_tier_entry_counts && s_tier_entry < 0x1000000u) s_tier_entry_counts[s_tier_entry]++;
+            }
             cpu->cycles        += (uint64_t)_cyc;
             cpu->master_cycles += _master;
             /* DRAM refresh tax — shared watermark with the AOT tier's
@@ -2822,7 +2920,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
             extern int snes_frame_counter;
             fprintf(stderr,
                     "[cyc] f=%d pc=$%06X op=$%02X cyc=%d bus_xfers=%u "
-                    "bus_master=%llu internal=%u master_delta=%llu now=%llu\n",
+                    "bus_master=%llu internal=%u master_delta=%llu now=%llu start=%llu\n",
                     snes_frame_counter, (unsigned)pc_before, (unsigned)op,
                     _cyc, s_interp_bus_cycles,
                     (unsigned long long)s_interp_bus_master,
@@ -2832,7 +2930,8 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                         (uint64_t)((unsigned)_cyc > s_interp_bus_cycles
                                        ? (unsigned)_cyc - s_interp_bus_cycles
                                        : 0) * 6u),
-                    (unsigned long long)cpu->master_cycles);
+                    (unsigned long long)cpu->master_cycles,
+                    (unsigned long long)_cyc_start);
         }
 
         if (auto_quiescent &&
@@ -3325,12 +3424,15 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     const char *_scope_name = interp_scope_name(entry_pc24);
     g_last_recomp_func = _scope_name;
     RecompStackPushInterpreter(_scope_name);
+    const uint32_t _saved_tier_entry = s_tier_entry;
+    s_tier_entry = entry_pc24 & 0xFFFFFFu;
     int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing,
                               out_return_pc, yield_pc,
                               yield_flag_addr, yield_flag_value,
                               reset_cap_on_bounce, stop_pcs, n_stop,
                               stop_on_rti);
     g_interp_wlog_pc24 = 0;  /* control returns to compiled code */
+    s_tier_entry = _saved_tier_entry;
     RecompStackPop();
     g_last_recomp_func = _saved_func;
     s_interp_bridge_depth--;
