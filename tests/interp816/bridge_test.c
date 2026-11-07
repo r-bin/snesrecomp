@@ -87,6 +87,22 @@ uint32_t cpu_region_speed(uint32_t addr24) {
 /* Bus-exact compiled code's I/O lead (cpu_state.c): no compiled code here. */
 uint32_t g_aot_access_prefix = AOT_NO_ACCESS, g_aot_access_wprefix = AOT_NO_ACCESS;
 int cpu_aot_access_lead(uint16 adr, uint32_t *lead) { (void)adr; (void)lead; return 0; }
+/* Compiled resume (cpu_state.c, common_cpu_infra.c): no compiled code here, so nothing resumes and no frame is live. */
+const unsigned g_aot_resume_count = 0;
+int g_recomp_yield_popped_top;
+int cpu_aot_resume_maybe(uint32 pc24) { (void)pc24; return 0; }
+RecompReturn (*cpu_aot_resume_fn(CpuState *cpu, uint32 pc24))(CpuState *) { (void)cpu; (void)pc24; return NULL; }
+RecompReturn cpu_dispatch_resume_paired(CpuState *cpu, uint32 pc24, uint16 entry_s, uint8 hrv,
+                                        RecompReturn (*fn)(CpuState *)) {
+    (void)cpu; (void)pc24; (void)entry_s; (void)hrv; (void)fn;
+    abort();   /* cpu_aot_resume_maybe never offers a resume */
+}
+int cpu_entry_frame(int slot, uint16_t *entry_s, uint8_t *hrv, int *tail) {
+    (void)slot; (void)entry_s; (void)hrv; (void)tail; return 0;
+}
+/* As common_cpu_infra.h declares it; that header cannot be included here (its g_fail is this file's). */
+typedef struct CpuTailcallContextSave { uint8_t valid; uint16_t entry_s; uint8_t hrv; } CpuTailcallContextSave;
+void cpu_tailcall_context_save(CpuTailcallContextSave *out) { if (out) memset(out, 0, sizeof *out); }
 uint8_t sdd1_read(Sdd1 *sdd1, uint16_t addr) {
     (void)sdd1;
     (void)addr;
