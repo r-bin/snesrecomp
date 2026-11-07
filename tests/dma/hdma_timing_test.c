@@ -52,6 +52,8 @@ void ppu_rasterReset(void) {}
 void (*g_ppu_latch_position_hook)(uint16_t *h_dot, uint16_t *v);
 /* ppu.c's beam hook for register accesses during rendering: ppu.c is not linked here. */
 bool (*g_ppu_beam_hook)(uint16_t adr, uint16_t *h_clock, uint16_t *v);
+/* Bus-exact compiled code's I/O lead (cpu_state.c): no compiled code here. */
+uint32_t g_aot_access_prefix = AOT_NO_ACCESS;
 
 void RtlApuLock(void) {}
 void RtlApuUnlock(void) {}
