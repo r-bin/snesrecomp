@@ -1218,6 +1218,47 @@ static void aot_resume_push(const AotResumeRec *chain, int k) {
 static uint32_t aot_resume_return_pc(CpuState *cpu, uint16_t entry_s, uint8_t hrv,
                                      uint32_t pc24);
 
+
+/* SNESRECOMP_TIER_STATS=1: how many instructions each tier ran, printed at
+ * exit, and the interpreted runs that ran the most (by the PC each run
+ * started at: a routine called from compiled code, or where the scheduler
+ * resumed). Compiled instructions are counted in region-paced code
+ * (cpu_aot_insn_begin). */
+static int s_tier_stats = -1;
+static uint64_t s_tier_aot, s_tier_interp;
+static uint32_t *s_tier_entry_counts;   /* interpreted instructions per run entry PC */
+static uint32_t s_tier_entry = 0xFFFFFFFFu;
+static int tier_cmp(const void *a, const void *b) {
+    const uint32_t x = s_tier_entry_counts[*(const uint32_t *)a];
+    const uint32_t y = s_tier_entry_counts[*(const uint32_t *)b];
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+static void tier_stats_print(void) {
+    const uint64_t all = s_tier_aot + s_tier_interp;
+    fprintf(stderr, "[tier] compiled %llu interpreted %llu instructions: %.2f %% native\n",
+            (unsigned long long)s_tier_aot, (unsigned long long)s_tier_interp,
+            all ? 100.0 * (double)s_tier_aot / (double)all : 0.0);
+    if (!s_tier_entry_counts) return;
+    static uint32_t pcs[1u << 16];
+    int n = 0;
+    for (uint32_t pc = 0; pc < 0x1000000u && n < (int)(1u << 16); pc++)
+        if (s_tier_entry_counts[pc]) pcs[n++] = pc;
+    qsort(pcs, (size_t)n, sizeof pcs[0], tier_cmp);
+    for (int i = 0; i < n && i < 40; i++)
+        fprintf(stderr, "[tier] interpreted from $%06X: %u instructions (%.2f %%)\n", (unsigned)pcs[i],
+                s_tier_entry_counts[pcs[i]], all ? 100.0 * s_tier_entry_counts[pcs[i]] / (double)all : 0.0);
+}
+static int tier_stats_on(void) {
+    if (s_tier_stats < 0) {
+        const char *e = getenv("SNESRECOMP_TIER_STATS");
+        s_tier_stats = e && e[0] == '1';
+        if (s_tier_stats) {
+            s_tier_entry_counts = (uint32_t *)calloc(0x1000000u, sizeof(uint32_t));
+            atexit(tier_stats_print);
+        }
+    }
+    return s_tier_stats;
+}
 /* A region-paced compiled instruction that stays compiled, at its start: the
  * host's per-instruction hook, as the interpreter calls it (a frame driver that
  * judges the last instruction before an interrupt needs every one), and
@@ -1225,6 +1266,7 @@ static uint32_t aot_resume_return_pc(CpuState *cpu, uint16_t entry_s, uint8_t hr
  * `start=`). */
 void cpu_aot_insn_begin(const CpuState *cpu, uint32_t pc16) {
     const uint32_t pc24 = ((uint32_t)cpu->PB << 16) | (pc16 & 0xFFFF);
+    if (tier_stats_on()) s_tier_aot++;
     if (g_interp_bridge_pc_hook)
         g_interp_bridge_pc_hook(pc24, cpu->m_flag ? 1 : 0, cpu->x_flag ? 1 : 0);
     static int on = -1;
@@ -3061,6 +3103,10 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                ? (unsigned)_cyc - s_interp_bus_cycles : 0;
             uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
             g_interp_bridge_steps++;
+            if (tier_stats_on()) {
+                s_tier_interp++;
+                if (s_tier_entry_counts && s_tier_entry < 0x1000000u) s_tier_entry_counts[s_tier_entry]++;
+            }
             cpu->cycles        += (uint64_t)_cyc;
             cpu->master_cycles += _master;
             /* DRAM refresh tax — shared watermark with the AOT tier's
@@ -3645,12 +3691,15 @@ static int interp_bridge_run_ex2(CpuState *cpu, uint32_t entry_pc24,
     const char *_scope_name = interp_scope_name(entry_pc24);
     g_last_recomp_func = _scope_name;
     RecompStackPushInterpreter(_scope_name);
+    const uint32_t _saved_tier_entry = s_tier_entry;
+    s_tier_entry = entry_pc24 & 0xFFFFFFu;
     int _r = _interp_run_core(cpu, entry_pc24, s_exit, out_landing,
                               out_return_pc, yield_pc,
                               yield_flag_addr, yield_flag_value,
                               reset_cap_on_bounce, stop_pcs, n_stop,
                               stop_on_rti);
     g_interp_wlog_pc24 = 0;  /* control returns to compiled code */
+    s_tier_entry = _saved_tier_entry;
     RecompStackPop();
     g_last_recomp_func = _saved_func;
     s_interp_bridge_depth--;
